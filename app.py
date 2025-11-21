@@ -6,17 +6,25 @@ import os
 import json
 import requests
 from datetime import datetime, timedelta
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
+# Track which Zoho credentials were used
+current_zoho_client_id = None
+
 DATABASE_URL = os.getenv('DATABASE_URL')
 BEARER_TOKEN = os.getenv('BEARER_TOKEN')
 ZOHO_REFRESH_TOKEN = os.getenv('ZOHO_REFRESH_TOKEN')
 ZOHO_CLIENT_ID = os.getenv('ZOHO_CLIENT_ID')
 ZOHO_CLIENT_SECRET = os.getenv('ZOHO_CLIENT_SECRET')
+
+ZOHO_FALLBACK_REFRESH_TOKEN = os.getenv('ZOHO_FALLBACK_REFRESH_TOKEN')
+ZOHO_FALLBACK_CLIENT_ID = os.getenv('ZOHO_FALLBACK_CLIENT_ID')
+ZOHO_FALLBACK_CLIENT_SECRET = os.getenv('ZOHO_FALLBACK_CLIENT_SECRET')
 
 if not DATABASE_URL:
     raise RuntimeError('DATABASE_URL environment variable is not set')
@@ -26,13 +34,33 @@ if not ZOHO_REFRESH_TOKEN or not ZOHO_CLIENT_ID or not ZOHO_CLIENT_SECRET:
     raise RuntimeError('Zoho credentials (ZOHO_REFRESH_TOKEN, ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET) are not set')
 
 zoho_access_token_cache = {
-    'token': None,
-    'expires_at': None
+    'primary': {'token': None, 'expires_at': None},
+    'fallback': {'token': None, 'expires_at': None}
 }
 
 def get_db_connection():
     conn = psycopg2.connect(DATABASE_URL)
     return conn
+
+def log_request(endpoint, aphra_number, status, error_message=None, zoho_client_id=None, response_time_ms=0):
+    """Log API request to database"""
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO api_request_logs (endpoint, aphra_number, status, error_message, zoho_client_id_used, response_time_ms)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (endpoint, aphra_number, status, error_message, zoho_client_id, response_time_ms))
+        conn.commit()
+    except Exception as e:
+        print(f"Error logging request: {str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
 
 def convert_arrays_to_list(data):
     if isinstance(data, dict):
@@ -42,37 +70,62 @@ def convert_arrays_to_list(data):
     else:
         return data
 
-def get_zoho_access_token():
+def get_zoho_access_token(use_fallback=False):
     now = datetime.now()
+    cache_key = 'fallback' if use_fallback else 'primary'
     
-    if zoho_access_token_cache['token'] and zoho_access_token_cache['expires_at']:
-        if now < zoho_access_token_cache['expires_at']:
-            return zoho_access_token_cache['token']
+    # Check cache first
+    if zoho_access_token_cache[cache_key]['token'] and zoho_access_token_cache[cache_key]['expires_at']:
+        if now < zoho_access_token_cache[cache_key]['expires_at']:
+            return zoho_access_token_cache[cache_key]['token']
+    
+    # Select credentials based on whether we're using fallback
+    if use_fallback:
+        if not ZOHO_FALLBACK_REFRESH_TOKEN or not ZOHO_FALLBACK_CLIENT_ID or not ZOHO_FALLBACK_CLIENT_SECRET:
+            raise Exception('Fallback Zoho credentials are not configured')
+        refresh_token = ZOHO_FALLBACK_REFRESH_TOKEN
+        client_id = ZOHO_FALLBACK_CLIENT_ID
+        client_secret = ZOHO_FALLBACK_CLIENT_SECRET
+    else:
+        refresh_token = ZOHO_REFRESH_TOKEN
+        client_id = ZOHO_CLIENT_ID
+        client_secret = ZOHO_CLIENT_SECRET
     
     token_url = "https://accounts.zoho.com/oauth/v2/token"
     params = {
-        'refresh_token': ZOHO_REFRESH_TOKEN,
-        'client_id': ZOHO_CLIENT_ID,
-        'client_secret': ZOHO_CLIENT_SECRET,
+        'refresh_token': refresh_token,
+        'client_id': client_id,
+        'client_secret': client_secret,
         'grant_type': 'refresh_token'
     }
     
     response = requests.post(token_url, params=params)
     
     if response.status_code != 200:
-        raise Exception(f'Failed to get Zoho access token: {response.text}')
+        error_msg = f'Failed to get Zoho access token ({"fallback" if use_fallback else "primary"}): {response.text}'
+        raise Exception(error_msg)
     
     data = response.json()
     access_token = data.get('access_token')
     expires_in = data.get('expires_in', 3600)
     
-    zoho_access_token_cache['token'] = access_token
-    zoho_access_token_cache['expires_at'] = now + timedelta(seconds=expires_in - 60)
+    zoho_access_token_cache[cache_key]['token'] = access_token
+    zoho_access_token_cache[cache_key]['expires_at'] = now + timedelta(seconds=expires_in - 60)
     
     return access_token
 
-def fetch_from_zoho(module_name, record_id=None, criteria=None, fields=None):
-    access_token = get_zoho_access_token()
+def fetch_from_zoho(module_name, record_id=None, criteria=None, fields=None, use_fallback=False):
+    global current_zoho_client_id
+    try:
+        access_token = get_zoho_access_token(use_fallback=use_fallback)
+        # Set which client ID we're using
+        current_zoho_client_id = ZOHO_FALLBACK_CLIENT_ID if use_fallback else ZOHO_CLIENT_ID
+    except Exception as e:
+        # If primary credentials fail and fallback is available, try fallback
+        if not use_fallback and ZOHO_FALLBACK_REFRESH_TOKEN:
+            print(f"Primary Zoho credentials failed, trying fallback: {str(e)}")
+            return fetch_from_zoho(module_name, record_id, criteria, fields, use_fallback=True)
+        raise
     
     base_url = "https://www.zohoapis.com/crm/v2"
     headers = {
@@ -93,12 +146,29 @@ def fetch_from_zoho(module_name, record_id=None, criteria=None, fields=None):
     if fields:
         params['fields'] = fields
     
-    response = requests.get(url, headers=headers, params=params)
+    try:
+        response = requests.get(url, headers=headers, params=params)
+        
+        # If request failed, try fallback immediately (any status code error)
+        if response.status_code != 200:
+            error_data = response.text
+            # Try fallback if primary failed and fallback is available
+            if not use_fallback and ZOHO_FALLBACK_REFRESH_TOKEN:
+                print(f"Zoho API error (status {response.status_code}): {error_data[:100]}")
+                print(f"Switching to fallback credentials")
+                return fetch_from_zoho(module_name, record_id, criteria, fields, use_fallback=True)
+            
+            raise Exception(f'Failed to fetch from Zoho {module_name}: {error_data}')
+        
+        return response.json()
     
-    if response.status_code != 200:
-        raise Exception(f'Failed to fetch from Zoho {module_name}: {response.text}')
-    
-    return response.json()
+    except Exception as e:
+        # Catch any network or parsing errors and try fallback
+        if not use_fallback and ZOHO_FALLBACK_REFRESH_TOKEN:
+            print(f"Zoho API request failed: {str(e)}")
+            print(f"Switching to fallback credentials")
+            return fetch_from_zoho(module_name, record_id, criteria, fields, use_fallback=True)
+        raise
 
 @app.route('/api/medical-experts-rec', methods=['POST'])
 def get_medical_expert():
@@ -168,21 +238,27 @@ def get_medical_expert():
 
 @app.route('/api/medical-experts-zoho', methods=['POST'])
 def get_medical_expert_from_zoho():
+    global current_zoho_client_id
+    start_time = time.time()
+    aphra_number = request.args.get('aphra_number')
+    
     auth_header = request.headers.get('Authorization')
     
     if not auth_header or not auth_header.startswith('Bearer '):
+        log_request('/api/medical-experts-zoho', aphra_number, 'FAILED', 'Missing Authorization header', current_zoho_client_id, int((time.time() - start_time) * 1000))
         return jsonify({'error': 'Missing or invalid Authorization header'}), 401
     
     token = auth_header.split('Bearer ')[1]
     if token != BEARER_TOKEN:
+        log_request('/api/medical-experts-zoho', aphra_number, 'FAILED', 'Invalid token', current_zoho_client_id, int((time.time() - start_time) * 1000))
         return jsonify({'error': 'Invalid token'}), 401
     
-    aphra_number = request.args.get('aphra_number')
     if not aphra_number:
+        log_request('/api/medical-experts-zoho', aphra_number, 'FAILED', 'Missing aphra_number parameter', current_zoho_client_id, int((time.time() - start_time) * 1000))
         return jsonify({'error': 'aphra_number parameter is required'}), 400
     
     try:
-        medical_expert_fields = "id,Medical_Expert_First_Name,Last_Name,Doctor_ID,APHRA_Number,Vinici_User_Name"
+        medical_expert_fields = "id,Medical_Expert_First_Name,Last_Name,Doctor_ID,APHRA_Number,Vinici_User_Name,Medical_Degrees,Other_Medical_Degrees,Specialty_Qualifications,Other_Qualifications"
         criteria = f"(APHRA_Number:equals:{aphra_number})"
         
         medical_expert_response = fetch_from_zoho(
@@ -192,6 +268,7 @@ def get_medical_expert_from_zoho():
         )
         
         if not medical_expert_response.get('data') or len(medical_expert_response['data']) == 0:
+            log_request('/api/medical-experts-zoho', aphra_number, 'FAILED', 'Medical expert not found', current_zoho_client_id, int((time.time() - start_time) * 1000))
             return jsonify({'error': 'Medical expert not found'}), 404
         
         medical_expert = medical_expert_response['data'][0]
@@ -218,12 +295,20 @@ def get_medical_expert_from_zoho():
             'Doctor_ID': medical_expert.get('Doctor_ID'),
             'Vinici_User_Name': medical_expert.get('Vinici_User_Name'),
             'id': medical_expert.get('id'),
-            'Sectors_and_Schemes': cleaned_sectors
+            'Sectors_and_Schemes': cleaned_sectors,
+
+            # Added fields
+            'Medical_Degrees': medical_expert.get('Medical_Degrees'),
+            'Other_Medical_Degrees': medical_expert.get('Other_Medical_Degrees'),
+            'Specialty_Qualifications': medical_expert.get('Specialty_Qualifications'),
+            'Other_Qualifications': medical_expert.get('Other_Qualifications')
         }
         
+        log_request('/api/medical-experts-zoho', aphra_number, 'SUCCESS', None, current_zoho_client_id, int((time.time() - start_time) * 1000))
         return jsonify(response), 200
         
     except Exception as e:
+        log_request('/api/medical-experts-zoho', aphra_number, 'FAILED', str(e)[:500], current_zoho_client_id, int((time.time() - start_time) * 1000))
         return jsonify({'error': f'Zoho API error: {str(e)}'}), 500
 
 @app.route('/api/zoho-modules', methods=['GET'])
