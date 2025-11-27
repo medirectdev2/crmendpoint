@@ -333,7 +333,7 @@ def list_zoho_modules():
         response = requests.get(url, headers=headers)
         
         if response.status_code != 200:
-            return jsonify({'error': f'Failed to fetch modules: {response.text}'}), 500
+            return jsonify({'error': f'Failed to fetch modules: {response.text}'}), 400
         
         modules_data = response.json()
         modules = modules_data.get('modules', [])
